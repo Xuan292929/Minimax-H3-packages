@@ -1,0 +1,53 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Model weights & large binaries (do NOT commit to git)
+*.safetensors
+*.pt
+*.bin
+*.pth
+*.onnx
+
+# Generated outputs & media
+outputs/
+extracted_frames/
+*.mp4
+*.wav
+*.avi
+*.mov
+
+# Logs & temp
+*.log
+scratch/
+tmp/
+.temp/
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store

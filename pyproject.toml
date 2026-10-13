@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "packages"
+version = "0.1.0"
+description = "Industrial-grade pure PyTorch algorithm packages repository (featuring MiniMax-H3)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "torch>=2.4.0",
+    "torchvision>=0.19.0",
+    "torchaudio>=2.4.0",
+    "transformers>=4.45.0",
+    "safetensors>=0.4.0",
+    "einops>=0.8.0",
+    "numpy>=1.24.0",
+    "pillow>=9.5.0",
+    "tqdm>=4.65.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["packages*", "minimaxh3*"]

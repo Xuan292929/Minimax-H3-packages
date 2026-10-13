@@ -1,0 +1,12 @@
+# MiniMax-H3 Pure PyTorch Requirements
+# Zero dependency on diffusers, sglang, or flash-attn.
+
+torch>=2.4.0
+torchvision>=0.19.0
+torchaudio>=2.4.0
+transformers>=4.45.0
+safetensors>=0.4.0
+einops>=0.8.0
+numpy>=1.24.0
+Pillow>=9.5.0
+tqdm>=4.65.0
