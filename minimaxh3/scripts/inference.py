@@ -65,6 +65,8 @@ def main():
     parser.add_argument("--no_cpu_offload", dest="cpu_offload", action="store_false", help="Keep all models in GPU VRAM.")
     parser.add_argument("--first_frame", type=str, default=None, help="Optional image path for first frame conditioning.")
     parser.add_argument("--last_frame", type=str, default=None, help="Optional image path for last frame conditioning.")
+    parser.add_argument("--ref_images", nargs="+", type=str, default=None, help="Optional reference image path(s) for reference/multi-reference conditioning.")
+    parser.add_argument("--mode", type=str, default="auto", choices=["auto", "t2v", "fl2va", "ref2va"], help="Conditioning mode (auto-detected from inputs by default).")
     parser.add_argument("--extract_frames", action="store_true", default=True, help="Extract PNG frames from generated video.")
     parser.add_argument("--frames_dir", type=str, default=None, help="Directory to save extracted PNG frames.")
     parser.add_argument("--tile_size", type=int, default=256, help="VAE decode tile size (official default: 256).")
@@ -79,6 +81,12 @@ def main():
     print(f"Resolution: {args.width}x{args.height}, {args.num_frames} frames ({args.num_inference_steps} steps)", flush=True)
     print(f"Device: {args.device} (CPU offload: {args.cpu_offload})", flush=True)
     print(f"VAE Tiling: True (tile_size={args.tile_size}, tile_overlap={args.tile_overlap})", flush=True)
+    if args.first_frame:
+        print(f"First Frame: {args.first_frame}", flush=True)
+    if args.last_frame:
+        print(f"Last Frame: {args.last_frame}", flush=True)
+    if args.ref_images:
+        print(f"Reference Images ({len(args.ref_images)}): {args.ref_images}", flush=True)
 
     t0 = time.time()
     pipe = MiniMaxH3Pipeline.from_pretrained(
@@ -90,17 +98,6 @@ def main():
     t_load = time.time() - t0
     print(f"Model loading complete in {t_load:.1f}s.", flush=True)
 
-    keyframes = []
-    keyframe_indices = []
-    if args.first_frame:
-        print(f"Loading first frame: {args.first_frame}", flush=True)
-        keyframes.append(Image.open(args.first_frame))
-        keyframe_indices.append(0)
-    if args.last_frame:
-        print(f"Loading last frame: {args.last_frame}", flush=True)
-        keyframes.append(Image.open(args.last_frame))
-        keyframe_indices.append(-1)
-
     t1 = time.time()
     frames, audio = pipe(
         prompt=args.prompt,
@@ -111,8 +108,10 @@ def main():
         seed=args.seed,
         flow_shift=args.flow_shift,
         audio_flow_shift=args.audio_flow_shift,
-        keyframes=keyframes if keyframes else None,
-        keyframe_indices=keyframe_indices if keyframe_indices else None,
+        first_frame=args.first_frame,
+        last_frame=args.last_frame,
+        ref_images=args.ref_images,
+        mode=args.mode,
         tiled=True,
         tile_size=args.tile_size,
         tile_overlap=args.tile_overlap,

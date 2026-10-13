@@ -254,17 +254,26 @@ class MiniMaxH3Pipeline:
         self,
         prompt: str,
         keyframes: Optional[List[Image.Image]] = None,
+        ref_images: Optional[List[Image.Image]] = None,
         height: int = 480,
         width: int = 832,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Encode prompt into text embeddings and token tags.
+        Supports Text-to-Video (T2V), Frame-guided (FL2VA), and Reference-guided (Ref2VA).
         """
         if self._cpu_offload_enabled:
             self.text_encoder.to(self.device, dtype=self.torch_dtype)
 
         pixel_values = image_grid_thw = None
-        if keyframes:
+        if ref_images:
+            resized_refs = [img.convert("RGB").resize((width, height), Image.LANCZOS) for img in ref_images]
+            pixel_values, image_grid_thw, image_counts = image_token_counts(self.processor, resized_refs)
+            condition_labels = [("image", i + 1) for i in range(len(ref_images))]
+            input_ids, text_token_tags = presentation_ref2va(
+                self.tokenizer, prompt, condition_labels, image_counts, [], []
+            )
+        elif keyframes:
             resized_kf = [img.convert("RGB").resize((width, height), Image.LANCZOS) for img in keyframes]
             pixel_values, image_grid_thw, image_counts = image_token_counts(self.processor, resized_kf)
             input_ids, text_token_tags = presentation_fl2va(self.tokenizer, prompt, image_counts)
@@ -325,6 +334,7 @@ class MiniMaxH3Pipeline:
         audio_flow_shift: float = 3.0,
         keyframe_cond_anchor: Optional[torch.Tensor] = None,
         keyframe_indices: Optional[List[int]] = None,
+        ref_blocks: Optional[List[Dict[str, Any]]] = None,
         progress_bar_cmd: Callable = tqdm,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self._cpu_offload_enabled:
@@ -337,10 +347,17 @@ class MiniMaxH3Pipeline:
         text_len = prompt_embeds.shape[0]
         video_latent_t, latent_h, latent_w = video_latents.shape[2:]
         audio_latent_t = audio_latents.shape[-1]
-        kf_idx = keyframe_indices if keyframe_cond_anchor is not None else []
-        packed = self.packed_builder.build_packed_fl2va(
-            text_len, video_latent_t, latent_h, latent_w, audio_latent_t, kf_idx
-        )
+
+        if ref_blocks is not None and len(ref_blocks) > 0:
+            packed = self.packed_builder.build_packed_ref2va(
+                text_len, video_latent_t, latent_h, latent_w, audio_latent_t, ref_blocks
+            )
+        else:
+            kf_idx = keyframe_indices if keyframe_cond_anchor is not None else []
+            packed = self.packed_builder.build_packed_fl2va(
+                text_len, video_latent_t, latent_h, latent_w, audio_latent_t, kf_idx
+            )
+
         packed["token_tags"][packed["text_pos"]] = text_token_tags.cpu()
         packed = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in packed.items()}
 
@@ -474,45 +491,107 @@ class MiniMaxH3Pipeline:
         seed: int = 42,
         flow_shift: float = 6.0,
         audio_flow_shift: float = 3.0,
-        keyframes: Optional[List[Image.Image]] = None,
+        first_frame: Optional[Union[str, Image.Image]] = None,
+        last_frame: Optional[Union[str, Image.Image]] = None,
+        keyframes: Optional[List[Union[str, Image.Image]]] = None,
         keyframe_indices: Optional[List[int]] = None,
+        ref_images: Optional[List[Union[str, Image.Image]]] = None,
+        mode: str = "auto",
         tiled: bool = True,
         tile_size: int = 256,
         tile_overlap: int = 64,
         progress_bar_cmd: Callable = tqdm,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Generate synchronized video and audio from text prompt (and optional keyframes).
+        Generate synchronized video and audio from text prompt with full multimodal conditioning support:
+        - Text-to-Video (T2V): prompt only
+        - 首帧生视频 (First-frame I2V): first_frame provided
+        - 尾帧生视频 (Last-frame to video): last_frame provided
+        - 首尾帧生视频 (First & Last frame to video): first_frame and last_frame provided
+        - 参考生视频 / 多参 (Reference / Multi-Reference to video): ref_images provided
         """
         # Align spatial & temporal dimensions
         height = align_dimension(height, 32)
         width = align_dimension(width, 32)
         num_frames = align_video_frames(num_frames, 17, 5)
 
-        print(f"[MiniMaxH3Pipeline] Generating {width}x{height}, {num_frames} frames @ 24fps ({num_inference_steps} steps, seed={seed})...")
+        # Helper to convert path / image to RGB PIL Image
+        def _to_pil(img: Union[str, Image.Image]) -> Image.Image:
+            if isinstance(img, str):
+                return Image.open(img).convert("RGB")
+            return img.convert("RGB")
 
-        # 1. Text & Keyframe Encoding
+        # Resolve conditioning mode and inputs
+        resolved_keyframes: List[Image.Image] = []
+        resolved_kf_indices: List[int] = []
+        resolved_ref_images: Optional[List[Image.Image]] = None
+
+        if ref_images is not None and len(ref_images) > 0:
+            resolved_ref_images = [_to_pil(img) for img in ref_images]
+            active_mode = "ref2va"
+        elif first_frame is not None or last_frame is not None:
+            if first_frame is not None:
+                resolved_keyframes.append(_to_pil(first_frame))
+                resolved_kf_indices.append(0)
+            if last_frame is not None:
+                resolved_keyframes.append(_to_pil(last_frame))
+                resolved_kf_indices.append(-1)
+            active_mode = "fl2va"
+        elif keyframes is not None and len(keyframes) > 0:
+            resolved_keyframes = [_to_pil(img) for img in keyframes]
+            if keyframe_indices is not None:
+                resolved_kf_indices = list(keyframe_indices)
+            else:
+                resolved_kf_indices = [0] if len(resolved_keyframes) == 1 else [0, -1]
+            active_mode = "fl2va"
+        else:
+            active_mode = "t2v"
+
+        if mode != "auto":
+            active_mode = mode
+
+        print(f"[MiniMaxH3Pipeline] Mode: {active_mode} | Generating {width}x{height}, {num_frames} frames @ 24fps ({num_inference_steps} steps, seed={seed})...")
+
+        # 1. Text & Conditioning Prompt Encoding
         prompt_embeds, text_token_tags = self.encode_prompt(
             prompt=prompt,
-            keyframes=keyframes,
+            keyframes=resolved_keyframes if active_mode == "fl2va" else None,
+            ref_images=resolved_ref_images if active_mode == "ref2va" else None,
             height=height,
             width=width,
         )
 
-        # 2. Keyframe Latent Anchor
-        keyframe_cond_anchor = None
-        if keyframes is not None and keyframe_indices is not None:
+        # 2. Condition Latent Anchor Encoding
+        cond_anchor = None
+        ref_blocks = None
+
+        if active_mode == "ref2va" and resolved_ref_images:
+            if self._cpu_offload_enabled:
+                self.video_vae.to(self.device, dtype=self.torch_dtype)
+            all_ref_rows = []
+            for img in resolved_ref_images:
+                img_tensor = img.resize((width, height), Image.LANCZOS)
+                img_t = torch.from_numpy(np.array(img_tensor)).permute(2, 0, 1).float().unsqueeze(0) / 255.0
+                z_norm = self.video_vae.encode_video(img_t.to(self.device), dtype=self.torch_dtype, process_image=True)
+                rows = patchify_video(z_norm)
+                all_ref_rows.append(rows)
+            cond_anchor = torch.cat(all_ref_rows, dim=0).to(device=self.device, dtype=self.torch_dtype)
+            ref_blocks = [{"kind": "image", "latent_t": 1, "latent_h": height // 16, "latent_w": width // 16} for _ in resolved_ref_images]
+            if self._cpu_offload_enabled:
+                self.video_vae.to("cpu")
+                torch.cuda.empty_cache()
+
+        elif active_mode == "fl2va" and resolved_keyframes:
             if self._cpu_offload_enabled:
                 self.video_vae.to(self.device, dtype=self.torch_dtype)
             all_cond_rows = []
-            for img in keyframes:
-                img_tensor = img.convert("RGB").resize((width, height), Image.LANCZOS)
+            for img in resolved_keyframes:
+                img_tensor = img.resize((width, height), Image.LANCZOS)
                 img_t = torch.from_numpy(np.array(img_tensor)).permute(2, 0, 1).float().unsqueeze(0) / 255.0
                 z_norm = self.video_vae.encode_video(img_t.to(self.device), dtype=self.torch_dtype, process_image=True)
                 rows = patchify_video(z_norm)
                 all_cond_rows.append(rows)
-            clean_cond_rows = torch.cat(all_cond_rows, dim=0).to(device=self.device, dtype=self.torch_dtype)
-            keyframe_cond_anchor = clean_cond_rows
+            cond_anchor = torch.cat(all_cond_rows, dim=0).to(device=self.device, dtype=self.torch_dtype)
             if self._cpu_offload_enabled:
                 self.video_vae.to("cpu")
                 torch.cuda.empty_cache()
@@ -534,8 +613,9 @@ class MiniMaxH3Pipeline:
             num_inference_steps=num_inference_steps,
             flow_shift=flow_shift,
             audio_flow_shift=audio_flow_shift,
-            keyframe_cond_anchor=keyframe_cond_anchor,
-            keyframe_indices=keyframe_indices,
+            keyframe_cond_anchor=cond_anchor,
+            keyframe_indices=resolved_kf_indices if active_mode == "fl2va" else None,
+            ref_blocks=ref_blocks,
             progress_bar_cmd=progress_bar_cmd,
         )
 

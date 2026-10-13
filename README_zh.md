@@ -151,33 +151,90 @@ python minimaxh3/scripts/inference.py \
   --output_path ./outputs/lake.mp4
 ```
 
-### 4. Python API 代码调用
+### 4. 全模态条件控制生成（首帧 / 尾帧 / 首尾帧 / 多参参考）
+
+本代码库原生完整支持 MiniMax-H3 的全部多模态条件控制范式：
+
+#### 模式 1：首帧生视频（Image-to-Video / I2V）
+```bash
+python minimaxh3/scripts/inference.py \
+  --model_path ./checkpoints/FL2VA \
+  --first_frame ./assets/start_frame.png \
+  --prompt "神秘的水晶洞穴，闪耀着空灵的微光与脉冲能量。" \
+  --output_path ./outputs/i2v_first_frame.mp4
+```
+
+#### 模式 2：尾帧生视频（End-frame to Video）
+```bash
+python minimaxh3/scripts/inference.py \
+  --model_path ./checkpoints/FL2VA \
+  --last_frame ./assets/end_frame.png \
+  --prompt "镜头向前推向黄昏暮色中的群山剪影。" \
+  --output_path ./outputs/last_frame_gen.mp4
+```
+
+#### 模式 3：首尾帧过渡生视频（Start & End Frame Transition）
+```bash
+python minimaxh3/scripts/inference.py \
+  --model_path ./checkpoints/FL2VA \
+  --first_frame ./assets/start_frame.png \
+  --last_frame ./assets/end_frame.png \
+  --prompt "从黎明破晓的水晶洞穴平滑无缝过渡到金色落日的崇山峻岭。" \
+  --output_path ./outputs/transition_first_last.mp4
+```
+
+#### 模式 4：参考生视频 / 多图参考（Reference & Multi-Reference）
+```bash
+python minimaxh3/scripts/inference.py \
+  --model_path ./checkpoints/Ref2VA \
+  --ref_images ./assets/ref_subject.png ./assets/ref_style.png \
+  --prompt "一朵盛开在赛博霓虹灯光下的机械异星花朵。" \
+  --output_path ./outputs/multi_ref_video.mp4
+```
+
+---
+
+### 5. Python API 代码调用
 
 ```python
 import torch
-from packages.minimaxh3 import MiniMaxH3Pipeline
+from PIL import Image
+from minimaxh3.pipelines import MiniMaxH3Pipeline
 
 # 初始化音视频联合生成管线
 pipeline = MiniMaxH3Pipeline.from_pretrained(
     model_path="./checkpoints/FL2VA",
     device="cuda:0",
     torch_dtype=torch.bfloat16,
-    cpu_offload=False,
+    enable_cpu_offload=False,
 )
 
-# 生成音视频一体 MP4 文件
+# 1. 文生视频 (T2V)
 video, audio = pipeline(
-    prompt="A futuristic city with flying vehicles at neon night, cyberpunk aesthetic, ambient synthwave audio.",
+    prompt="A futuristic city at neon night, ambient synthwave audio.",
     height=480,
     width=832,
     num_frames=39,
-    num_inference_steps=25,
-    seed=42,
-    tile_size=256,
-    tile_overlap=64,
-    output_path="./outputs/cyberpunk.mp4",
 )
-print("音视频生成完成，已保存至 ./outputs/cyberpunk.mp4")
+
+# 2. 首帧生视频 (I2V)
+video, audio = pipeline(
+    prompt="The crystal glows brighter with mystic sparks.",
+    first_frame="start_frame.png",
+)
+
+# 3. 首尾帧过渡 (First & Last frame)
+video, audio = pipeline(
+    prompt="A cinematic transition connecting the start and end frames.",
+    first_frame="start_frame.png",
+    last_frame="end_frame.png",
+)
+
+# 4. 参考生视频 / 多参 (Multi-Reference)
+video, audio = pipeline(
+    prompt="Subject in style of references.",
+    ref_images=["ref1.png", "ref2.png"],
+)
 ```
 
 ---
@@ -205,18 +262,30 @@ python minimaxh3/scripts/convert_weights.py \
   --mode verify_roundtrip
 ```
 
-### 2. SFT / LoRA 轻量化微调
+### 2. SFT / LoRA 轻量化微调（支持全部条件模式）
 
-基于 Flow Matching 速度预测目标对 DiT 块进行参数高效微调：
+SFT 训练管线支持全模态 5 种条件范式的端到端训练与微调：
+- `t2v`: 纯文生视频训练
+- `first_frame`: 首帧生视频训练 (I2V)
+- `last_frame`: 尾帧生视频训练
+- `first_last`: 首尾帧过渡训练
+- `multi_ref`: 参考生视频 / 多参训练
+
 ```bash
+# 依次对所有模式进行验证训练
 python minimaxh3/scripts/train_sft.py \
-  --model_path ./checkpoints/FL2VA \
-  --num_layers 4 \
+  --task_mode all \
+  --steps 5 \
+  --device cuda:0
+
+# 或指定具体模式训练指定步数
+python minimaxh3/scripts/train_sft.py \
+  --task_mode first_frame \
+  --steps 100 \
   --lora_rank 16 \
   --lr 1e-4 \
-  --steps 100 \
   --device cuda:0 \
-  --output_dir ./outputs/sft_checkpoint
+  --output_dir ./outputs/sft_first_frame
 ```
 
 ### 3. 架构零依赖审计

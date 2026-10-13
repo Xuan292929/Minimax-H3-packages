@@ -103,7 +103,8 @@ def inject_lora(model: nn.Module, rank: int = 16, target_modules: Tuple[str, ...
 
 class MiniMaxH3LatentsDataset(Dataset):
     """
-    Dataset supplying pre-encoded video latents, audio latents, and text prompt embeddings.
+    Dataset supplying pre-encoded video latents, audio latents, text prompt embeddings,
+    and optional reference/keyframe latents for all SFT task modes.
     """
 
     def __init__(
@@ -113,6 +114,7 @@ class MiniMaxH3LatentsDataset(Dataset):
         height: int = 480,
         width: int = 832,
         num_frames: int = 22,
+        num_ref_images: int = 2,
         text_dim: int = 5120,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
@@ -120,7 +122,7 @@ class MiniMaxH3LatentsDataset(Dataset):
         if samples is not None and len(samples) > 0:
             self.samples = samples
         else:
-            print(f"[Dataset] Creating {num_synthetic_samples} training latents (frames={num_frames}, res={width}x{height})...")
+            print(f"[Dataset] Creating {num_synthetic_samples} training latents (frames={num_frames}, res={width}x{height}, refs={num_ref_images})...")
             self.samples = []
             video_latent_t = ((num_frames - 5) // 17) * 5 + 2
             latent_h = height // 16
@@ -134,6 +136,7 @@ class MiniMaxH3LatentsDataset(Dataset):
                     "audio_latents": torch.randn((2, 32, audio_latent_t), dtype=dtype),
                     "prompt_embeds": torch.randn((prompt_len, text_dim), dtype=dtype),
                     "text_token_tags": torch.ones((prompt_len,), dtype=torch.long),
+                    "ref_latents": torch.randn((num_ref_images, 24, 1, latent_h, latent_w), dtype=dtype),
                     "height": height,
                     "width": width,
                     "num_frames": num_frames,
@@ -149,7 +152,12 @@ class MiniMaxH3LatentsDataset(Dataset):
 
 class MiniMaxH3SFTTrainer:
     """
-    SFT Trainer implementing Flow Matching loss for MiniMax-H3 joint video-audio model.
+    SFT Trainer implementing Flow Matching loss for MiniMax-H3 across all conditioning modes:
+    - t2v: Pure Text-to-Video
+    - first_frame: 首帧生视频 (I2V)
+    - last_frame: 尾帧生视频
+    - first_last: 首尾帧生视频 (Start & End frame transition)
+    - multi_ref: 参考生视频 / 多参 (Reference / Multi-Reference images)
     """
 
     def __init__(
@@ -193,7 +201,7 @@ class MiniMaxH3SFTTrainer:
 
         self.optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
 
-    def train_step(self, batch: Dict[str, Any]) -> Tuple[float, float, float]:
+    def train_step(self, batch: Dict[str, Any], task_mode: str = "t2v") -> Tuple[float, float, float]:
         self.dit.train()
         self.optimizer.zero_grad()
 
@@ -207,7 +215,7 @@ class MiniMaxH3SFTTrainer:
         t_video_val = self.scheduler.timesteps[t_idx]
         t_audio_val = self.scheduler_audio.timesteps[t_idx]
 
-        # 2. Add flow-matching noise
+        # 2. Add flow-matching noise to target video and audio
         # x_t = (1 - sigma) * x_0 + sigma * eps
         # target = eps - x_0
         noise_video = torch.randn_like(clean_video)
@@ -219,15 +227,51 @@ class MiniMaxH3SFTTrainer:
         target_video = self.scheduler.training_target(clean_video, noise_video)
         target_audio = self.scheduler_audio.training_target(clean_audio, noise_audio)
 
-        # 3. Packed sequence forward pass
+        # 3. Packed sequence forward pass with multimodal conditioning
         text_len = prompt_embeds.shape[0]
         video_latent_t, latent_h, latent_w = clean_video.shape[2:]
         audio_latent_t = clean_audio.shape[-1]
         audio_channel = clean_audio.shape[0]
 
-        packed = self.packed_builder.build_packed_fl2va(
-            text_len, video_latent_t, latent_h, latent_w, audio_latent_t, keyframe_indices=[]
-        )
+        cond_anchor = None
+        ref_blocks = None
+
+        if task_mode == "first_frame":
+            # Condition on clean first frame
+            first_frame = clean_video[:, :, 0:1, :, :]
+            cond_anchor = patchify_video(first_frame)
+            packed = self.packed_builder.build_packed_fl2va(
+                text_len, video_latent_t, latent_h, latent_w, audio_latent_t, keyframe_indices=[0]
+            )
+        elif task_mode == "last_frame":
+            # Condition on clean last frame
+            last_frame = clean_video[:, :, -1:, :, :]
+            cond_anchor = patchify_video(last_frame)
+            packed = self.packed_builder.build_packed_fl2va(
+                text_len, video_latent_t, latent_h, latent_w, audio_latent_t, keyframe_indices=[-1]
+            )
+        elif task_mode == "first_last":
+            # Condition on clean first & last frames
+            first_frame = clean_video[:, :, 0:1, :, :]
+            last_frame = clean_video[:, :, -1:, :, :]
+            cond_anchor = torch.cat([patchify_video(first_frame), patchify_video(last_frame)], dim=0)
+            packed = self.packed_builder.build_packed_fl2va(
+                text_len, video_latent_t, latent_h, latent_w, audio_latent_t, keyframe_indices=[0, -1]
+            )
+        elif task_mode == "multi_ref":
+            # Condition on reference image latents
+            ref_latents = batch["ref_latents"].to(self.device, dtype=self.dtype)
+            all_refs = [patchify_video(ref_latents[i : i + 1]) for i in range(ref_latents.shape[0])]
+            cond_anchor = torch.cat(all_refs, dim=0)
+            ref_blocks = [{"kind": "image", "latent_t": 1, "latent_h": latent_h, "latent_w": latent_w} for _ in range(ref_latents.shape[0])]
+            packed = self.packed_builder.build_packed_ref2va(
+                text_len, video_latent_t, latent_h, latent_w, audio_latent_t, ref_blocks
+            )
+        else:  # "t2v"
+            packed = self.packed_builder.build_packed_fl2va(
+                text_len, video_latent_t, latent_h, latent_w, audio_latent_t, keyframe_indices=[]
+            )
+
         packed["token_tags"][packed["text_pos"]] = text_token_tags.cpu()
         packed = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in packed.items()}
 
@@ -236,9 +280,12 @@ class MiniMaxH3SFTTrainer:
 
         img_pos, audio_pos, text_pos = packed["img_pos"], packed["audio_pos"], packed["text_pos"]
         cu, seq_len = packed["cu_seqlens"], packed["seq_len"]
+        cond_rows_count = 0 if cond_anchor is None else cond_anchor.shape[0]
 
         x = torch.zeros(1, seq_len, 96, dtype=self.dtype, device=self.device)
-        x[0].index_copy_(0, img_pos, video_rows)
+        x[0].index_copy_(0, img_pos[cond_rows_count:], video_rows)
+        if cond_anchor is not None:
+            x[0].index_copy_(0, img_pos[:cond_rows_count], cond_anchor)
 
         audio_x = torch.zeros(1, seq_len, 32, dtype=self.dtype, device=self.device)
         audio_x[0].index_copy_(0, audio_pos, audio_rows)
@@ -248,8 +295,10 @@ class MiniMaxH3SFTTrainer:
 
         timesteps = torch.full((seq_len,), t_video_norm, dtype=torch.float32, device=self.device)
         timesteps[audio_pos] = t_audio_norm
-        unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
+        if cond_anchor is not None and cond_rows_count > 0:
+            timesteps[img_pos[:cond_rows_count]] = 0.999
 
+        unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
         refiner_cu = torch.tensor([0, text_len, text_len], dtype=torch.int32, device=self.device)
 
         v_video_rows, v_audio_rows = self.dit(
@@ -270,6 +319,7 @@ class MiniMaxH3SFTTrainer:
             use_gradient_checkpointing=True,
         )
 
+        v_video_rows = v_video_rows[cond_rows_count:]
         pred_v_video = unpatchify_video(v_video_rows, video_latent_t, latent_h, latent_w)
         pred_v_audio = unpack_audio(v_audio_rows, audio_channel, audio_latent_t)
 
@@ -289,18 +339,19 @@ class MiniMaxH3SFTTrainer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MiniMax-H3 SFT Training.")
+    parser = argparse.ArgumentParser(description="MiniMax-H3 SFT Training with Full Multimodal Conditioning.")
     parser.add_argument("--model_path", type=str, default=os.environ.get("MINIMAX_MODEL_PATH", "./checkpoints/FL2VA"), help="Base model path.")
+    parser.add_argument("--task_mode", type=str, default="all", choices=["t2v", "first_frame", "last_frame", "first_last", "multi_ref", "all"], help="Training task conditioning mode.")
     parser.add_argument("--num_layers", type=int, default=4, help="Number of DiT blocks for SFT training/validation.")
-    parser.add_argument("--steps", type=int, default=5, help="Number of training steps.")
+    parser.add_argument("--steps", type=int, default=5, help="Number of training steps per task mode.")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--lora_rank", type=int, default=16, help="LoRA rank.")
     parser.add_argument("--device", type=str, default="cuda:0", help="CUDA device.")
     parser.add_argument("--output_dir", type=str, default="./outputs/sft_checkpoint", help="Output directory.")
     args = parser.parse_args()
 
-    print("=== MiniMax-H3 Standalone SFT Training ===")
-    print(f"Device: {args.device}, Num Layers: {args.num_layers}, Steps: {args.steps}, LR: {args.lr}")
+    print("=== MiniMax-H3 Standalone Multimodal SFT Training ===")
+    print(f"Device: {args.device}, Num Layers: {args.num_layers}, Task Mode: {args.task_mode}, Steps: {args.steps}, LR: {args.lr}")
 
     # Set default dtype to bfloat16 for fast and light memory allocation
     torch.set_default_dtype(torch.bfloat16)
@@ -309,7 +360,7 @@ def main():
     dit = MiniMaxH3DiTModel(num_layers=args.num_layers)
 
     # Load dataset
-    dataset = MiniMaxH3LatentsDataset(num_synthetic_samples=args.steps, num_frames=22)
+    dataset = MiniMaxH3LatentsDataset(num_synthetic_samples=args.steps * 5, num_frames=22, num_ref_images=2)
 
     trainer = MiniMaxH3SFTTrainer(
         dit=dit,
@@ -320,24 +371,34 @@ def main():
         lora_rank=args.lora_rank,
     )
 
-    losses = []
-    print(f"Starting SFT training loop ({args.steps} steps)...")
-    for step in range(args.steps):
-        t0 = time.time()
-        batch = dataset[step]
-        loss_total, loss_v, loss_a = trainer.train_step(batch)
-        dt = time.time() - t0
-        losses.append(loss_total)
-        print(f"  [Step {step + 1}/{args.steps}] Total Loss: {loss_total:.4f} (Video: {loss_v:.4f}, Audio: {loss_a:.4f}) [{dt:.2f}s]")
+    modes_to_train = ["t2v", "first_frame", "last_frame", "first_last", "multi_ref"] if args.task_mode == "all" else [args.task_mode]
+
+    all_losses = {}
+    print(f"\nStarting SFT training across modes: {modes_to_train}...")
+    sample_cursor = 0
+    for mode in modes_to_train:
+        print(f"\n--- [Task Mode: {mode}] ---")
+        mode_losses = []
+        for step in range(args.steps):
+            t0 = time.time()
+            batch = dataset[sample_cursor % len(dataset)]
+            sample_cursor += 1
+            loss_total, loss_v, loss_a = trainer.train_step(batch, task_mode=mode)
+            dt = time.time() - t0
+            mode_losses.append(loss_total)
+            print(f"  [{mode} | Step {step + 1}/{args.steps}] Total Loss: {loss_total:.4f} (Video: {loss_v:.4f}, Audio: {loss_a:.4f}) [{dt:.2f}s]")
+        all_losses[mode] = mode_losses
+        print(f"  Mode {mode} loss: {mode_losses[0]:.4f} -> {mode_losses[-1]:.4f}")
 
     # Save trained checkpoint
     os.makedirs(args.output_dir, exist_ok=True)
     ckpt_file = os.path.join(args.output_dir, "sft_lora_final.safetensors")
     lora_sd = {k: v.cpu() for k, v in trainer.dit.state_dict().items() if "lora_" in k}
     save_file(lora_sd, ckpt_file)
-    print(f"[Trainer] SFT training completed successfully! Saved LoRA checkpoint to {ckpt_file}")
-    print(f"Initial Loss: {losses[0]:.4f} -> Final Loss: {losses[-1]:.4f}")
-    print("=== SFT Training Validation Succeeded ===")
+    print(f"\n[Trainer] SFT training completed successfully! Saved LoRA checkpoint to {ckpt_file}")
+    for mode, l_list in all_losses.items():
+        print(f"  - {mode}: initial {l_list[0]:.4f} -> final {l_list[-1]:.4f}")
+    print("=== SFT Training Validation Succeeded for All Conditioning Modes ===")
 
 
 if __name__ == "__main__":

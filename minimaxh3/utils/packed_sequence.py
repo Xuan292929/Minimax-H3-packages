@@ -175,7 +175,8 @@ class PackedSequenceBuilder:
             kind = b["kind"]
             info = {"kind": kind, "visual_rows": 0, "audio_rows": 0, "ref_audio_t": int(b.get("ref_audio_t", 0))}
             if kind in ("image", "video", "video_audio"):
-                lt_r, lh_r, lw_r = int(b["latent_t"]), int(b["latent_h"]), int(b["latent_w"])
+                lt_r = int(b.get("latent_t", 1))
+                lh_r, lw_r = int(b["latent_h"]), int(b["latent_w"])
                 info.update(visual_rows=lt_r * (lh_r // 2) * (lw_r // 2), latent_t=lt_r, latent_h=lh_r, latent_w=lw_r)
                 total_ref_visual_rows += info["visual_rows"]
                 info["audio_rows"] = info["ref_audio_t"] * audio_channel
@@ -262,7 +263,7 @@ class PackedSequenceBuilder:
         audio_pos = torch.cat(ref_audio_pos_parts + [target_audio_pos]) if ref_audio_pos_parts else target_audio_pos
 
         token_tags[img_pos] = 0
-        token_tags[target_audio_sl] = 2
+        token_tags[audio_pos] = 2
         text_pos = torch.arange(0, text_len)
         cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
 

@@ -48,8 +48,8 @@ def resample_waveform(waveform: torch.Tensor, orig_sr: int, target_sr: int) -> t
 
 def save_video_audio(
     video_frames: Union[List[Image.Image], torch.Tensor],
-    output_path: str,
-    audio_waveform: Optional[torch.Tensor] = None,
+    output_path: Union[str, torch.Tensor],
+    audio_waveform: Optional[Union[str, torch.Tensor]] = None,
     fps: int = 24,
     audio_sample_rate: int = 32000,
 ) -> str:
@@ -57,6 +57,11 @@ def save_video_audio(
     Save video frames and optional audio soundtrack into an MP4 file.
     Uses ffmpeg to combine H.264 video with AAC audio.
     """
+    # Gracefully handle swapped argument order save_video_audio(frames, audio, path)
+    if isinstance(output_path, torch.Tensor) and isinstance(audio_waveform, (str, os.PathLike)):
+        audio_waveform, output_path = output_path, str(audio_waveform)
+    output_path = str(output_path)
+
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     # Convert frames to numpy array uint8 [T, H, W, 3]

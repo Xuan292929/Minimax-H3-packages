@@ -151,33 +151,90 @@ python minimaxh3/scripts/inference.py \
   --output_path ./outputs/lake.mp4
 ```
 
-### 4. Python API Usage
+### 4. Multimodal Conditioning Modes (首帧 / 尾帧 / 首尾帧 / 多参参考)
+
+The pipeline natively supports all MiniMax-H3 conditioning workflows via both CLI and Python API:
+
+#### Mode 1: 首帧生视频 (First Frame to Video / I2V)
+```bash
+python minimaxh3/scripts/inference.py \
+  --model_path ./checkpoints/FL2VA \
+  --first_frame ./assets/start_frame.png \
+  --prompt "A magical glowing crystal cavern with flowing ethereal waters." \
+  --output_path ./outputs/i2v_first_frame.mp4
+```
+
+#### Mode 2: 尾帧生视频 (Last Frame to Video)
+```bash
+python minimaxh3/scripts/inference.py \
+  --model_path ./checkpoints/FL2VA \
+  --last_frame ./assets/end_frame.png \
+  --prompt "Camera panning toward a golden twilight sunset over mountains." \
+  --output_path ./outputs/last_frame_gen.mp4
+```
+
+#### Mode 3: 首尾帧生视频 (Start & End Frame Transition / 首尾帧)
+```bash
+python minimaxh3/scripts/inference.py \
+  --model_path ./checkpoints/FL2VA \
+  --first_frame ./assets/start_frame.png \
+  --last_frame ./assets/end_frame.png \
+  --prompt "A seamless cinematic transition from dawn crystal cave to sunset mountains." \
+  --output_path ./outputs/transition_first_last.mp4
+```
+
+#### Mode 4: 参考生视频 / 多参 (Reference & Multi-Reference Images)
+```bash
+python minimaxh3/scripts/inference.py \
+  --model_path ./checkpoints/Ref2VA \
+  --ref_images ./assets/ref_subject.png ./assets/ref_style.png \
+  --prompt "A cybernetic futuristic flower blooming in neon lighting." \
+  --output_path ./outputs/multi_ref_video.mp4
+```
+
+---
+
+### 5. Python API Usage
 
 ```python
 import torch
-from packages.minimaxh3 import MiniMaxH3Pipeline
+from PIL import Image
+from minimaxh3.pipelines import MiniMaxH3Pipeline
 
 # Initialize pipeline
 pipeline = MiniMaxH3Pipeline.from_pretrained(
     model_path="./checkpoints/FL2VA",
     device="cuda:0",
     torch_dtype=torch.bfloat16,
-    cpu_offload=False,
+    enable_cpu_offload=False,
 )
 
-# Generate synchronized video and audio
+# 1. Text-to-Video (T2V)
 video, audio = pipeline(
-    prompt="A futuristic city with flying vehicles at neon night, cyberpunk aesthetic, ambient synthwave audio.",
+    prompt="A futuristic city at neon night, ambient synthwave audio.",
     height=480,
     width=832,
     num_frames=39,
-    num_inference_steps=25,
-    seed=42,
-    tile_size=256,
-    tile_overlap=64,
-    output_path="./outputs/cyberpunk.mp4",
 )
-print("Generation finished! Video and audio saved to ./outputs/cyberpunk.mp4")
+
+# 2. 首帧生视频 (I2V)
+video, audio = pipeline(
+    prompt="The crystal glows brighter with mystic sparks.",
+    first_frame="start_frame.png",
+)
+
+# 3. 首尾帧过渡 (First & Last frame)
+video, audio = pipeline(
+    prompt="A cinematic transition connecting the start and end frames.",
+    first_frame="start_frame.png",
+    last_frame="end_frame.png",
+)
+
+# 4. 参考生视频 / 多参 (Multi-Reference)
+video, audio = pipeline(
+    prompt="Subject in style of references.",
+    ref_images=["ref1.png", "ref2.png"],
+)
 ```
 
 ---
@@ -205,17 +262,30 @@ python minimaxh3/scripts/convert_weights.py \
   --mode verify_roundtrip
 ```
 
-### 2. SFT / LoRA Fine-Tuning
+### 2. SFT / LoRA Fine-Tuning (All Conditioning Modes Supported)
+
+The SFT training pipeline supports fine-tuning across all 5 conditioning paradigms:
+- `t2v`: Pure Text-to-Video
+- `first_frame`: 首帧生视频 (I2V)
+- `last_frame`: 尾帧生视频
+- `first_last`: 首尾帧生视频
+- `multi_ref`: 参考生视频 / 多参
 
 ```bash
+# Train across all modes in sequence
 python minimaxh3/scripts/train_sft.py \
-  --model_path ./checkpoints/FL2VA \
-  --num_layers 4 \
+  --task_mode all \
+  --steps 5 \
+  --device cuda:0
+
+# Or train a specific conditioning mode
+python minimaxh3/scripts/train_sft.py \
+  --task_mode first_frame \
+  --steps 100 \
   --lora_rank 16 \
   --lr 1e-4 \
-  --steps 100 \
   --device cuda:0 \
-  --output_dir ./outputs/sft_checkpoint
+  --output_dir ./outputs/sft_first_frame
 ```
 
 ### 3. Zero-Dependency Audit
