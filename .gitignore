@@ -52,3 +52,5 @@ test_assets/
 *.swp
 *.swo
 .DS_Store
+
+record.md
