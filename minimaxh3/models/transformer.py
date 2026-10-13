@@ -8,7 +8,7 @@ Pure PyTorch implementation with zero dependency on sglang or diffusers.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -520,10 +520,74 @@ class MiniMaxH3DiTModel(nn.Module):
         return video_logits, audio_logits
 
 
+class BlockFP8Linear(nn.Module):
+    """
+    128x128 Block-scaled FP8 Linear layer for MiniMax-H3 DiT.
+    Native PyTorch module without third-party dependencies.
+    Holds weight in torch.float8_e4m3fn and weight_scale_inv in torch.float32.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device: Optional[Union[str, torch.device]] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.register_buffer("weight", torch.empty((out_features, in_features), dtype=torch.float8_e4m3fn, device=device))
+        s_rows = (out_features + 127) // 128
+        s_cols = (in_features + 127) // 128
+        self.register_buffer("weight_scale_inv", torch.empty((s_rows, s_cols), dtype=torch.float32, device=device))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features, dtype=torch.bfloat16, device=device))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out_dim, in_dim = self.weight.shape
+        scale_exp = self.weight_scale_inv.repeat_interleave(128, dim=0)[:out_dim, :].repeat_interleave(128, dim=1)[:, :in_dim]
+        w = (self.weight.to(torch.float32) * scale_exp.to(torch.float32)).to(x.dtype)
+        return F.linear(x, w, self.bias)
+
+
+def convert_linear_to_block_fp8(model: nn.Module, target_submodules: Iterable[str]) -> None:
+    """
+    Convert named linear submodules in `model` to BlockFP8Linear.
+    `target_submodules` contains paths like 'blocks.0.attn.qkv_proj'.
+    """
+    for full_name in target_submodules:
+        parts = full_name.split(".")
+        parent = model
+        for p in parts[:-1]:
+            if hasattr(parent, p):
+                parent = getattr(parent, p)
+            elif p.isdigit() and isinstance(parent, (nn.ModuleList, list)):
+                parent = parent[int(p)]
+            else:
+                parent = None
+                break
+        if parent is None:
+            continue
+        attr = parts[-1]
+        if hasattr(parent, attr):
+            old_layer = getattr(parent, attr)
+            if isinstance(old_layer, nn.Linear):
+                has_bias = old_layer.bias is not None
+                new_layer = BlockFP8Linear(old_layer.in_features, old_layer.out_features, bias=has_bias)
+                setattr(parent, attr, new_layer)
+
+
 __all__ = [
     "MiniMaxH3DiTModel",
+    "BlockFP8Linear",
+    "convert_linear_to_block_fp8",
     "patchify_video",
     "unpatchify_video",
     "pack_audio",
     "unpack_audio",
 ]
+

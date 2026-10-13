@@ -359,8 +359,32 @@ def main():
     print(f"Initializing DiT Transformer (num_layers={args.num_layers})...")
     dit = MiniMaxH3DiTModel(num_layers=args.num_layers)
 
+    if args.model_path:
+        tr_path = os.path.join(args.model_path, "transformer") if os.path.exists(os.path.join(args.model_path, "transformer")) else args.model_path
+        if os.path.exists(tr_path):
+            print(f"Loading pretrained weights into DiT from {tr_path}...")
+            try:
+                from minimaxh3.pipelines.pipeline_minimax_h3 import _load_sharded_safetensors
+            except ImportError:
+                from packages.minimaxh3.pipelines.pipeline_minimax_h3 import _load_sharded_safetensors
+            tr_sd = _load_sharded_safetensors(tr_path, device="cpu", dtype=torch.bfloat16, dequantize_fp8=True)
+            clean_sd = {}
+            for k, v in tr_sd.items():
+                k_clean = k.replace("model.diffusion_model.", "").replace("transformer.", "")
+                if k_clean.startswith("blocks."):
+                    b_idx = int(k_clean.split(".")[1])
+                    if b_idx >= args.num_layers:
+                        continue
+                clean_sd[k_clean] = v
+            missing, unexpected = dit.load_state_dict(clean_sd, strict=False, assign=True)
+            print(f"  Loaded {len(clean_sd)} pretrained weights into DiT (missing: {len(missing)}, unexpected: {len(unexpected)})")
+            del tr_sd, clean_sd
+            import gc
+            gc.collect()
+
     # Load dataset
     dataset = MiniMaxH3LatentsDataset(num_synthetic_samples=args.steps * 5, num_frames=22, num_ref_images=2)
+
 
     trainer = MiniMaxH3SFTTrainer(
         dit=dit,

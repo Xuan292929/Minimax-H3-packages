@@ -151,7 +151,19 @@ python minimaxh3/scripts/inference.py \
   --output_path ./outputs/lake.mp4
 ```
 
+#### 方式 D：原生 128x128 Block-FP8 极速低显存推理
+支持直接载入 128x128 块缩放 FP8 检查点（如 Singularity-FP8 或量化后的模型），节约 50% 显存并加速推理：
+```bash
+python minimaxh3/scripts/inference.py \
+  --model_path ./checkpoints/Singularity-FP8 \
+  --prompt "A majestic lion standing proudly on a rocky outcrop at sunset..." \
+  --fp8 \
+  --output_path ./outputs/lion_fp8.mp4
+```
+> 注：若输入为 FP8 权重但未添加 `--fp8`，管线将自动在载入时动态反量化至 BF16 运行标准高精计算。
+
 ### 4. 全模态条件控制生成（首帧 / 尾帧 / 首尾帧 / 多参参考）
+
 
 本代码库原生完整支持 MiniMax-H3 的全部多模态条件控制范式：
 

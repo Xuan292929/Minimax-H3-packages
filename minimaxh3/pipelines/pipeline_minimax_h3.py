@@ -30,7 +30,9 @@ from ..models.text_encoder import (
     video_token_counts,
 )
 from ..models.transformer import (
+    BlockFP8Linear,
     MiniMaxH3DiTModel,
+    convert_linear_to_block_fp8,
     pack_audio,
     patchify_video,
     unpack_audio,
@@ -42,11 +44,49 @@ from ..utils.media_io import convert_to_stereo, resample_waveform, save_video_au
 from ..utils.packed_sequence import PackedSequenceBuilder, align_dimension, align_video_frames
 
 
+def _process_shard_dict(
+    shard_dict: Dict[str, torch.Tensor],
+    device: str,
+    dtype: torch.dtype,
+    key_filter: Optional[Callable[[str], bool]],
+    dequantize_fp8: bool,
+) -> Dict[str, torch.Tensor]:
+    processed = {}
+    if dequantize_fp8:
+        scale_map = {k[:-len("_scale_inv")]: k for k in shard_dict.keys() if k.endswith(".weight_scale_inv")}
+        for k, v in shard_dict.items():
+            if k.endswith(".weight_scale_inv"):
+                continue
+            if key_filter is not None and not key_filter(k):
+                continue
+            if k in scale_map:
+                w_fp8 = v.to(device)
+                scale_inv = shard_dict[scale_map[k]].to(device)
+                out_dim, in_dim = w_fp8.shape
+                scale_exp = scale_inv.repeat_interleave(128, dim=0)[:out_dim, :].repeat_interleave(128, dim=1)[:, :in_dim]
+                w_dequant = (w_fp8.to(torch.float32) * scale_exp.to(torch.float32)).to(dtype)
+                processed[k] = w_dequant
+            else:
+                processed[k] = v.to(device=device, dtype=dtype)
+    else:
+        for k, v in shard_dict.items():
+            if key_filter is not None and not key_filter(k):
+                continue
+            if v.dtype == torch.float8_e4m3fn:
+                processed[k] = v.to(device=device)
+            elif k.endswith(".weight_scale_inv"):
+                processed[k] = v.to(device=device, dtype=torch.float32)
+            else:
+                processed[k] = v.to(device=device, dtype=dtype)
+    return processed
+
+
 def _load_sharded_safetensors(
     model_dir: str,
     device: str = "cpu",
     dtype: torch.dtype = torch.bfloat16,
     key_filter: Optional[Callable[[str], bool]] = None,
+    dequantize_fp8: bool = False,
 ) -> Dict[str, torch.Tensor]:
     index_file = os.path.join(model_dir, "model.safetensors.index.json")
     state_dict = {}
@@ -66,24 +106,20 @@ def _load_sharded_safetensors(
         for shard in shard_files:
             shard_path = os.path.join(model_dir, shard)
             shard_dict = load_file(shard_path, device=device)
-            for k, v in shard_dict.items():
-                if key_filter is None or key_filter(k):
-                    state_dict[k] = v.to(device=device, dtype=dtype)
+            p_dict = _process_shard_dict(shard_dict, device=device, dtype=dtype, key_filter=key_filter, dequantize_fp8=dequantize_fp8)
+            state_dict.update(p_dict)
     else:
         single_file = os.path.join(model_dir, "model.safetensors")
         if os.path.exists(single_file):
             shard_dict = load_file(single_file, device=device)
-            for k, v in shard_dict.items():
-                if key_filter is None or key_filter(k):
-                    state_dict[k] = v.to(device=device, dtype=dtype)
+            state_dict.update(_process_shard_dict(shard_dict, device=device, dtype=dtype, key_filter=key_filter, dequantize_fp8=dequantize_fp8))
         else:
             st_files = sorted([f for f in os.listdir(model_dir) if f.endswith(".safetensors")])
             for st in st_files:
                 shard_dict = load_file(os.path.join(model_dir, st), device=device)
-                for k, v in shard_dict.items():
-                    if key_filter is None or key_filter(k):
-                        state_dict[k] = v.to(device=device, dtype=dtype)
+                state_dict.update(_process_shard_dict(shard_dict, device=device, dtype=dtype, key_filter=key_filter, dequantize_fp8=dequantize_fp8))
     return state_dict
+
 
 
 class MiniMaxH3Pipeline:
@@ -137,12 +173,13 @@ class MiniMaxH3Pipeline:
         torch_dtype: torch.dtype = torch.bfloat16,
         device: Union[str, torch.device] = "cuda",
         enable_cpu_offload: bool = True,
+        use_fp8: bool = False,
     ) -> "MiniMaxH3Pipeline":
         """
         Load MiniMax-H3 pipeline from pretrained checkpoint directory.
         `model_path` should contain subfolders: text_encoder, transformer, video_vae, audio_vae, processor.
         """
-        print(f"[MiniMaxH3Pipeline] Loading models from {model_path} with dtype {torch_dtype}...")
+        print(f"[MiniMaxH3Pipeline] Loading models from {model_path} with dtype {torch_dtype} (use_fp8={use_fp8})...")
 
         # 1. Processor & Tokenizer
         processor_path = os.path.join(model_path, "processor")
@@ -163,11 +200,6 @@ class MiniMaxH3Pipeline:
         )
         load_device = "cpu" if enable_cpu_offload else device
 
-        # Re-register rotary embeddings on load_device to eliminate non-persistent meta buffers
-        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-            Qwen3VLTextRotaryEmbedding,
-            Qwen3VLVisionRotaryEmbedding,
-        )
         text_encoder.model.language_model.rotary_emb = Qwen3VLTextRotaryEmbedding(config=text_encoder.config.text_config, device=load_device)
         text_encoder.model.visual.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(config=text_encoder.config.vision_config)
 
@@ -188,11 +220,44 @@ class MiniMaxH3Pipeline:
         gc.collect()
 
         # 3. DiT Transformer
-        print("  - Initializing DiT Transformer...")
+        tr_path = os.path.join(model_path, "transformer")
+        is_fp8_ckpt = False
+        idx_path = os.path.join(tr_path, "model.safetensors.index.json")
+        fp8_submodules = set()
+        if os.path.exists(idx_path):
+            with open(idx_path, "r") as f:
+                idx_data = json.load(f)
+            for k in idx_data.get("weight_map", {}).keys():
+                if "weight_scale_inv" in k:
+                    is_fp8_ckpt = True
+                    k_clean = k.replace("model.diffusion_model.", "").replace("transformer.", "")
+                    submod = k_clean[:-len(".weight_scale_inv")]
+                    fp8_submodules.add(submod)
+        else:
+            st_files = [f for f in os.listdir(tr_path) if f.endswith(".safetensors")]
+            for st in st_files[:1]:
+                hdr = load_file(os.path.join(tr_path, st), device="cpu")
+                for k in hdr.keys():
+                    if "weight_scale_inv" in k:
+                        is_fp8_ckpt = True
+                        k_clean = k.replace("model.diffusion_model.", "").replace("transformer.", "")
+                        submod = k_clean[:-len(".weight_scale_inv")]
+                        fp8_submodules.add(submod)
+
+        print(f"  - Initializing DiT Transformer (is_fp8_ckpt: {is_fp8_ckpt}, use_fp8: {use_fp8})...")
         with torch.device("meta"):
             dit = MiniMaxH3DiTModel()
-        tr_path = os.path.join(model_path, "transformer")
-        tr_sd = _load_sharded_safetensors(tr_path, device=load_device, dtype=torch_dtype)
+
+        if is_fp8_ckpt and use_fp8:
+            print("    Converting DiT linear layers to native BlockFP8Linear...")
+            convert_linear_to_block_fp8(dit, fp8_submodules)
+            tr_sd = _load_sharded_safetensors(tr_path, device=load_device, dtype=torch_dtype, dequantize_fp8=False)
+        elif is_fp8_ckpt and not use_fp8:
+            print("    Dequantizing FP8 checkpoint to BF16 for high-precision DiT execution...")
+            tr_sd = _load_sharded_safetensors(tr_path, device=load_device, dtype=torch_dtype, dequantize_fp8=True)
+        else:
+            tr_sd = _load_sharded_safetensors(tr_path, device=load_device, dtype=torch_dtype, dequantize_fp8=False)
+
         clean_tr_sd = {}
         for k, v in tr_sd.items():
             k_clean = k.replace("model.diffusion_model.", "").replace("transformer.", "")
@@ -201,6 +266,7 @@ class MiniMaxH3Pipeline:
         print(f"    DiT Transformer loaded. (missing: {len(missing)}, unexpected: {len(unexpected)})")
         del tr_sd, clean_tr_sd
         gc.collect()
+
 
         # 4. Video VAE
         print("  - Initializing Video VAE...")

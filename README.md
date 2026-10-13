@@ -151,7 +151,19 @@ python minimaxh3/scripts/inference.py \
   --output_path ./outputs/lake.mp4
 ```
 
+#### Option D: Native 128x128 Block-FP8 Fast Low-VRAM Inference
+Directly load 128x128 block-scaled FP8 checkpoints (such as Singularity-FP8 or RTN FP8 DiT models) to save ~50% VRAM and accelerate inference:
+```bash
+python minimaxh3/scripts/inference.py \
+  --model_path ./checkpoints/Singularity-FP8 \
+  --prompt "A majestic lion standing proudly on a rocky outcrop at sunset..." \
+  --fp8 \
+  --output_path ./outputs/lion_fp8.mp4
+```
+> Note: If loading an FP8 checkpoint without `--fp8`, the pipeline automatically dequantizes weights to BF16 on load for standard high-precision execution.
+
 ### 4. Multimodal Conditioning Modes (首帧 / 尾帧 / 首尾帧 / 多参参考)
+
 
 The pipeline natively supports all MiniMax-H3 conditioning workflows via both CLI and Python API:
 

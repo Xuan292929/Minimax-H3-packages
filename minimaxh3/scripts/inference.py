@@ -71,6 +71,7 @@ def main():
     parser.add_argument("--frames_dir", type=str, default=None, help="Directory to save extracted PNG frames.")
     parser.add_argument("--tile_size", type=int, default=256, help="VAE decode tile size (official default: 256).")
     parser.add_argument("--tile_overlap", type=int, default=64, help="VAE decode tile overlap (official default: 64).")
+    parser.add_argument("--fp8", action="store_true", default=False, help="Run DiT in native 128x128 Block-FP8 mode (saves ~50% VRAM).")
 
     args = parser.parse_args()
 
@@ -79,7 +80,7 @@ def main():
     print(f"Model Path: {args.model_path}", flush=True)
     print(f"Prompt: {args.prompt}", flush=True)
     print(f"Resolution: {args.width}x{args.height}, {args.num_frames} frames ({args.num_inference_steps} steps)", flush=True)
-    print(f"Device: {args.device} (CPU offload: {args.cpu_offload})", flush=True)
+    print(f"Device: {args.device} (CPU offload: {args.cpu_offload}, FP8 native: {args.fp8})", flush=True)
     print(f"VAE Tiling: True (tile_size={args.tile_size}, tile_overlap={args.tile_overlap})", flush=True)
     if args.first_frame:
         print(f"First Frame: {args.first_frame}", flush=True)
@@ -94,7 +95,9 @@ def main():
         torch_dtype=torch.bfloat16,
         device=args.device,
         enable_cpu_offload=args.cpu_offload,
+        use_fp8=args.fp8,
     )
+
     t_load = time.time() - t0
     print(f"Model loading complete in {t_load:.1f}s.", flush=True)
 
